@@ -11,9 +11,8 @@ def create_bridge_node(robot_name):
 
 def generate_launch_description():
 
-    robots = ['px4_1']
+    robots = ['radd']
 
     bridge_nodes = [create_bridge_node(r) for r in robots]
 
     return LaunchDescription(bridge_nodes)
-

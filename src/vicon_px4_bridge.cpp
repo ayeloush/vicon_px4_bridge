@@ -13,15 +13,16 @@ using std::placeholders::_1;
 class ViconPX4Bridge : public rclcpp::Node {
 public:
   ViconPX4Bridge() : Node("vicon_px4_bridge") {
-    this->declare_parameter<std::string>("px4_name", "drone1");
-    this->declare_parameter<std::string>("vicon_name", "drone1");
+    this->declare_parameter<std::string>("px4_name", "radd");
+    this->declare_parameter<std::string>("vicon_name", "radd");
     std::string vicon_name;
     this->get_parameter("px4_name", px4_name);
     this->get_parameter("vicon_name", vicon_name);
     std::string vicon_sub_name = "vicon/" + vicon_name + "/" + vicon_name;
 
     std::string timesync_sub_name = px4_name + "/fmu/out/timesync";
-    std::string px4_pub_name = px4_name + "/fmu/in/vehicle_visual_odometry";
+    //std::string px4_pub_name = px4_name + "/fmu/in/vehicle_visual_odometry";
+    std::string px4_pub_name = "/fmu/in/vehicle_visual_odometry";
 
     RCLCPP_INFO(this->get_logger(), "vicon_sub_name: %s \n",
                 vicon_sub_name.c_str());
@@ -97,14 +98,29 @@ private:
     // quaternion
     auto q_vicon = vicon_msg.transform.rotation;
     tf2::Quaternion tf2_vicon(q_vicon.x, q_vicon.y, q_vicon.z, q_vicon.w);
-    auto yaw = tf2::getYaw(tf2_vicon);
-    auto yaw_ned = -yaw + 1.57;
-    Eigen::Quaternion<double> out(cos(yaw_ned / 2.0), 0, 0, sin(yaw_ned / 2.0));
+    // auto yaw = tf2::getYaw(tf2_vicon);
+    // auto yaw_ned = -yaw + 1.57;
+    // Eigen::Quaternion<double> out(cos(yaw_ned / 2.0), 0, 0, sin(yaw_ned / 2.0));
 
-    message.q[0] = out.w();
-    message.q[1] = out.x();
-    message.q[2] = out.y();
-    message.q[3] = out.z();
+    // message.q[0] = out.w();
+    // message.q[1] = out.x();
+    // message.q[2] = out.y();
+    // message.q[3] = out.z();
+
+  double roll_vicon, pitch_vicon, yaw_vicon;
+  tf2::Matrix3x3(tf2_vicon).getRPY(roll_vicon, pitch_vicon, yaw_vicon);
+
+  double roll_ned  = roll_vicon;
+  double pitch_ned = -pitch_vicon;
+  double yaw_ned   = -yaw_vicon + 1.5708;
+
+  tf2::Quaternion q_ned;
+  q_ned.setRPY(roll_ned, pitch_ned, yaw_ned);
+
+  message.q[0] = q_ned.getW();
+  message.q[1] = q_ned.getX();
+  message.q[2] = q_ned.getY();
+  message.q[3] = q_ned.getZ();
 
     // velocity frame
     message.velocity_frame =
