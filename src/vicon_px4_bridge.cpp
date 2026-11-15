@@ -1,7 +1,10 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include <Eigen/Eigen>
 #include <Eigen/Geometry>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <vector>
 #include <px4_msgs/msg/timesync_status.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -18,6 +21,18 @@ public:
     std::string vicon_name;
     this->get_parameter("px4_name", px4_name);
     this->get_parameter("vicon_name", vicon_name);
+
+    // Timing. timestamp_sample is the Vicon frame time (the vicon_bridge header stamp: grab time minus
+    // the SDK's reported latency), so PX4's EKF fuses each pose at the time it was measured even when
+    // this bridge falls behind; EKF2_EV_DELAY then only covers what that stamp leaves out (~0-5 ms).
+    // Needs the vicon_bridge and this node on the same clock (same machine, or chrony-synced).
+    use_vicon_stamp_ = this->declare_parameter<bool>("use_vicon_stamp", true);
+    // Drop poses older than this: the EKF's delayed horizon is EKF2_DELAY_MAX (default 200 ms).
+    max_sample_age_ms_ = this->declare_parameter<double>("max_sample_age_ms", 150.0);
+    // A header stamp further than this in the future means the clocks disagree: stamp on receipt.
+    max_future_ms_ = this->declare_parameter<double>("max_future_ms", 5.0);
+    // Forward every n-th pose (1 = all; PX4's EKF accepts vision samples down to ~7 ms apart).
+    downsample_ = std::max<int64_t>(1, this->declare_parameter<int64_t>("downsample", 1));
     std::string vicon_sub_name = "vicon/" + vicon_name + "/" + vicon_name;
 
     std::string timesync_sub_name = px4_name + "/fmu/out/timesync";
@@ -32,9 +47,11 @@ public:
                 px4_pub_name.c_str());
     RCLCPP_INFO(this->get_logger(), "Using Vicon -> Visual Odometry callback!");
 
+    // Sensor-data QoS with a short queue: with per-pose stamps a late pose is still useful, and a
+    // depth-1 queue silently drops poses whenever a callback runs late.
     position_sub_ =
         this->create_subscription<geometry_msgs::msg::TransformStamped>(
-            vicon_sub_name, 1,
+            vicon_sub_name, rclcpp::SensorDataQoS().keep_last(10),
             std::bind(&ViconPX4Bridge::position_callback, this, _1));
 
     odometry_pub_ = this->create_publisher<px4_msgs::msg::VehicleOdometry>(
@@ -60,7 +77,37 @@ private:
   std::atomic<uint64_t> px4_timestamp_;
   std::atomic<uint64_t> px4_server_timestamp_;
 
-  uint8_t counter_ = 0;
+  uint64_t counter_ = 0;
+  bool use_vicon_stamp_ = true;
+  double max_sample_age_ms_ = 150.0;
+  double max_future_ms_ = 5.0;
+  int64_t downsample_ = 1;
+
+  // Pose age (receipt minus Vicon frame time) statistics, reported every 5 s.
+  std::vector<double> ages_ms_;
+  int64_t last_report_us_ = 0;
+  uint64_t dropped_old_ = 0, clock_mismatch_ = 0;
+
+  void report_ages(int64_t now_us) {
+    if (last_report_us_ == 0) {
+      last_report_us_ = now_us;
+      return;
+    }
+    if (now_us - last_report_us_ < 5000000) {
+      return;
+    }
+    if (!ages_ms_.empty()) {
+      std::sort(ages_ms_.begin(), ages_ms_.end());
+      RCLCPP_INFO(this->get_logger(),
+                  "vicon pose age at bridge [ms]: median %.1f, p95 %.1f, max "
+                  "%.1f (n=%zu); dropped as too old: %lu, clock mismatch: %lu",
+                  ages_ms_[ages_ms_.size() / 2],
+                  ages_ms_[(ages_ms_.size() * 95) / 100], ages_ms_.back(),
+                  ages_ms_.size(), dropped_old_, clock_mismatch_);
+    }
+    ages_ms_.clear();
+    last_report_us_ = now_us;
+  }
 
   uint64_t get_current_timestamp() {
     auto delta =
@@ -73,19 +120,40 @@ private:
   position_callback(const geometry_msgs::msg::TransformStamped &vicon_msg) {
 
     auto message = px4_msgs::msg::VehicleOdometry();
-    constexpr int downsample = 2;
     counter_++;
-    if (!(counter_ % downsample == 0)) {
+    if (counter_ % downsample_ != 0) {
       return;
     }
 
-    // // timestamps
-    // auto timestamp = get_current_timestamp();
-    // message.timestamp = timestamp;
-    // message.timestamp_sample = timestamp;
-    //
-    message.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-    message.timestamp_sample = message.timestamp;
+    // timestamps: PX4's uXRCE-DDS client converts both from this machine's ROS
+    // time to its own clock (timesync offset).
+    const int64_t now_us = this->get_clock()->now().nanoseconds() / 1000;
+    message.timestamp = now_us;
+    message.timestamp_sample = now_us;
+    if (use_vicon_stamp_) {
+      const int64_t stamp_us =
+          static_cast<int64_t>(vicon_msg.header.stamp.sec) * 1000000 +
+          vicon_msg.header.stamp.nanosec / 1000;
+      const double age_ms = (now_us - stamp_us) / 1000.0;
+      report_ages(now_us);
+      if (age_ms > max_sample_age_ms_) {
+        dropped_old_++;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "dropping vicon pose %.0f ms old (max_sample_age_ms %.0f)",
+                             age_ms, max_sample_age_ms_);
+        return;
+      }
+      if (age_ms < -max_future_ms_) {
+        clock_mismatch_++;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "vicon header stamp is %.0f ms in the future: the vicon_bridge "
+                             "clock disagrees with this machine's; stamping on receipt",
+                             -age_ms);
+      } else {
+        message.timestamp_sample = std::min(stamp_us, now_us);
+        ages_ms_.push_back(age_ms);
+      }
+    }
 
     // pose frame
     message.pose_frame = px4_msgs::msg::VehicleOdometry::POSE_FRAME_NED;
